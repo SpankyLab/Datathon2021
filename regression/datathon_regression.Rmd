@@ -1,0 +1,1319 @@
+---
+title: "Datathon Regression"
+author: "Ryuta Yoshimatsu"
+output:
+  html_document: 
+    number_sections: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+
+```{r packages, message = FALSE}
+library(statsr)
+library(dplyr)
+library(MASS)
+library(BAS)
+library(ggplot2)
+library(devtools)
+library(gridExtra)
+library(grid)
+library(GGally)
+library(PreProcess)
+```
+
+# Exploratory Data Analysis
+
+```{r load, message = FALSE}
+load("ames_train.Rdata")
+load("ames_test.Rdata")
+load("ames_validation.Rdata")
+nrow(ames_train)
+nrow(ames_test)
+nrow(ames_validation)
+```
+
+Let us first take a look into the structure and the dimension of the data set.
+
+```{r}
+# Show the entire structure of the data set
+ames_all <- rbind(ames_train, ames_test, ames_validation)
+str(ames_all)
+```
+
+```{r}
+# Show the number of numeric and factor variables
+nums <- unlist(lapply(ames_all, is.numeric))
+fcts <- unlist(lapply(ames_all, is.factor))
+cat(sum(nums), '\t', sum(fcts))
+```
+
+There are **2,580 rows** with **80 columns** in the data set (including `ames_train`, `ames_test` and `ames_validation`), of which **38 are numerical** and **43 are categorical**.
+
+**Response Variable**
+
+We first take a look into our response variable **`price`**:
+
+```{r, fig.width=6.5, fig.height=6.5}
+# Function to plot Normal QQ
+qqplot.data <- function (vec) # argument: vector of numbers
+{
+  y <- quantile(vec[!is.na(vec)], c(0.25, 0.75))
+  x <- qnorm(c(0.25, 0.75))
+  slope <- diff(y)/diff(x)
+  int <- y[1L] - slope * x[1L]
+  d <- data.frame(resids = vec)
+  ggplot(d, aes(sample = resids)) + stat_qq() + geom_abline(slope = slope, intercept = int) + xlab("Theoretical Quantiles") + ylab("Sample Quantiles")
+}
+
+p1 <- ggplot(ames_all, aes(price)) + geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.75, color='blue', fill='blue') + geom_density()
+p2 <- ggplot(ames_all, aes(log(price))) + geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.75, color='blue', fill='blue') + geom_density()
+n1 <- qqplot.data(ames_all$price)
+n2 <- qqplot.data(log(ames_all$price))
+
+grid.arrange(
+  p1, p2, n1, n2,
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+
+summary(ames_all$price)
+summary(log(ames_all$price))
+
+library(moments)
+cat('Skewness and kurtosis of price:\t\t', skewness(ames_all$price), '\t',  kurtosis(ames_all$price), '\n') 
+cat('Skewness and kurtosis of ln(price):\t', skewness(log(ames_all$price)), '\t',  kurtosis(log(ames_all$price)), '\n') 
+```
+
+The distribution of `price`:
+
+- is **positively skewed** with skewness 1.75, kurtosis 8.419952, median at 159900 and mean at 178060
+- has **minimum at 12,789** and **maximum at 755,000**
+- becomes more **symmetric and normal** after log transform.
+
+**Completeness**
+
+Next, we evaluate the **completeness** of the data set and impute any missing values.
+
+```{r, message = FALSE, warning = FALSE}
+# Show all columns with NA values
+NAcolumn <- which(colSums(is.na(ames_all)) > 0)
+sort(colSums(sapply(ames_all[NAcolumn], is.na)), decreasing = TRUE)/nrow(ames_all)
+```
+
+**Handling NA**
+
+```{r}
+library(forcats)
+
+# For missing Garage.Yr.Blt, we provide Year.Built
+ames_all$Garage.Yr.Blt[is.na(ames_all$Garage.Yr.Blt)] <- ames_all$Year.Built[is.na(ames_all$Garage.Yr.Blt)]
+
+# For missing all other numerical variables, we provide 0
+ames_all <- ames_all %>% mutate_if(is.numeric, ~replace(., is.na(.), 0))
+
+# For missing all categorical variables, we provide value 'None' 
+ames_all <- ames_all %>% mutate_if(is.factor, fct_explicit_na, na_level = 'None')
+
+# Drop a factor column with only 1 level
+ames_all <- ames_all %>% dplyr::select(-Utilities) %>% dplyr::select(-Sale.Condition)
+
+# Factorize a discrete int column 
+ames_all$MS.SubClass <- as.factor(ames_all$MS.SubClass)
+```
+
+**Detailed EDA**
+
+We use random forest with 100 trees to quickly evaluate the important features.
+
+```{r, fig.height=7.5, message = FALSE, warning = FALSE}
+# Run a quick random forest with 100 trees to find important features
+library(randomForest)
+set.seed(1)
+model_rf <- randomForest(log(price) ~ . , data=ames_all[1:nrow(ames_train),], ntree=100, importance=TRUE)
+imp_RF <- importance(model_rf)
+imp_DF <- data.frame(Variables = row.names(imp_RF), MSE = imp_RF[,1])
+imp_DF <- imp_DF[order(imp_DF$MSE, decreasing = TRUE),]
+imp_var <- c(imp_DF[1:30,'Variables'])
+ggplot(imp_DF[1:30,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + geom_bar(stat = 'identity') + labs(x = 'Variables', y= '% increase in MSE if variable values are randomely shuffled (permuted)') + coord_flip() + theme(legend.position="none")
+```
+
+We proceed with our analysis using the top 30 important features that `model_rf` suggests.
+ 
+```{r}
+ames_all <- ames_all %>% dplyr::select(price, all_of(imp_var))
+num_variables <- dplyr::select_if(ames_all[1:nrow(ames_train),], is.numeric)
+cat_variables <- dplyr::select_if(ames_all[1:nrow(ames_train),], is.factor)
+```
+
+We analyze the **correlation** between these fields with the response variable and within themselves. We look at the numerical variables first:
+
+```{r, fig.width=7.5, fig.height=7.5}
+library(corrplot)
+
+# Compute correlation between numerical values
+correlationMatrix <- cor(num_variables)
+
+# Sort on decreasing correlations with price
+cor_sorted <- as.matrix(sort(correlationMatrix[, 'price'], decreasing = TRUE))
+
+# Select only high correlations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+correlationMatrix <- correlationMatrix[CorHigh, CorHigh]
+corrplot.mixed(correlationMatrix, tl.col="black", tl.pos="lt")
+```
+
+The color-coded correlation matrix (above) shows numerical attributes that have absolute correlation strength greater than 0.5 to `price`. **`Overall.Qual`** shows strong correlation (>0.75) with `price`. Other features like **`area`**, **`Total.Bsmt.SF`** and **`Full.Bath`** show medium to strong correlation (0.5-0.75).
+
+We exclude **`X1st.Flr.SF`**, **`Garage.Area`**, **`Garage.Yr.Blt`** and **`TotRms.AbvGrd`** due to **multicollinearity** (correlation strength larger than 0.75 with another independent variable). 
+
+```{r}
+ames_all <- ames_all %>% 
+  dplyr::select(all_of(c(CorHigh)), colnames(cat_variables)) %>% 
+  dplyr::select(-X1st.Flr.SF, -Garage.Area, -Garage.Yr.Blt, -TotRms.AbvGrd)
+```
+
+We note that the following combinations of variables exhibit absolute correlation strength (0.5-0.75): `Overall.Qual & area`, `Overall.Qual & Total.Bsmt.SF`, `Overall.Qual & Garage.Cars`, `Overall.Qual & Year.Built`, `Overall.Qual & Year.Remod.Add`, `Overall.Qual & Full.Bath`, `area & Garage.Cars`, `area & Full.Bath`, `Garage.Cars & Year.Built`, `Year.Built & Year.Remod.Add`. 
+
+```{r}
+# Numerical variables
+names(dplyr::select_if(ames_all[1:nrow(ames_train),], is.numeric))
+
+# Categorical variables
+names(dplyr::select_if(ames_all[1:nrow(ames_train),], is.factor))
+```
+
+
+```{r, fig.width=10, fig.height=10, message = FALSE, warning = FALSE}
+p1 <- ggplot(aes(x=Overall.Qual, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p2 <- ggplot(aes(x=area, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p3 <- ggplot(aes(x=Total.Bsmt.SF, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p4 <- ggplot(aes(x=Garage.Cars, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p5 <- ggplot(aes(x=Year.Built, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p6 <- ggplot(aes(x=Year.Remod.Add, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p7 <- ggplot(aes(x=Full.Bath, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+p8 <- ggplot(aes(x=Fireplaces, y=log(price)), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=loess, fill="red", color="red") + geom_smooth(method=lm, fill="blue", color="blue")
+
+# Create a grid of plots
+grid.arrange(
+  p1, p2, p3, p4, p5, p6, p7, p8,
+  nrow = 3,
+  top = "log(price)",
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+Next, we look into the **categorical features**. We analyze the distribution of each variables using box plots.
+
+```{r, fig.height=37.5, fig.width=7.5}
+b1 <- ggplot(aes(x=reorder(Neighborhood, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) + xlab("Neighborhood")
+b2 <- ggplot(aes(x=reorder(MS.SubClass, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("MS.SubClass")
+b3 <- ggplot(aes(x=reorder(BsmtFin.Type.1, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("BsmtFin.Type.1")
+b4 <- ggplot(aes(x=reorder(Garage.Type, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Garage.Type")
+b5 <- ggplot(aes(x=reorder(Bsmt.Qual, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Bsmt.Qual")
+b6 <- ggplot(aes(x=reorder(Kitchen.Qual, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Kitchen.Qual")
+b7 <- ggplot(aes(x=reorder(Central.Air, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Central.Air")
+b8 <- ggplot(aes(x=reorder(Bsmt.Exposure, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Bsmt.Exposure")
+b9 <- ggplot(aes(x=reorder(Fireplace.Qu, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Fireplace.Qu")
+b10 <- ggplot(aes(x=reorder(MS.Zoning, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("MS.Zoning")
+b11 <- ggplot(aes(x=reorder(Exterior.1st, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("Exterior.1st") + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())
+b12 <- ggplot(aes(x=reorder(House.Style, log(price), fun=median), y=log(price)), data=ames_all) + geom_boxplot(alpha = 0.75, color='blue') + xlab("House.Style")
+
+h1 <- ggplot(ames_all, aes(reorder(Neighborhood, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) + xlab("Neighborhood") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h2 <- ggplot(ames_all, aes(x=reorder(MS.SubClass, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("MS.SubClass") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h3 <- ggplot(ames_all, aes(x=reorder(BsmtFin.Type.1, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("BsmtFin.Type.1") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h4 <- ggplot(ames_all, aes(x=reorder(Garage.Type, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Garage.Type") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h5 <- ggplot(ames_all, aes(x=reorder(Bsmt.Qual, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Bsmt.Qual") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h6 <- ggplot(ames_all, aes(x=reorder(Kitchen.Qual, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Kitchen.Qual") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h7 <- ggplot(ames_all, aes(x=reorder(Central.Air, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Central.Air") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h8 <- ggplot(ames_all, aes(x=reorder(Bsmt.Exposure, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Bsmt.Exposure") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h9 <- ggplot(ames_all, aes(x=reorder(Fireplace.Qu, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Fireplace.Qu") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h10 <- ggplot(ames_all, aes(x=reorder(MS.Zoning, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("MS.Zoning") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+h11 <- ggplot(ames_all, aes(x=reorder(Exterior.1st, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("Exterior.1st") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())
+h12 <- ggplot(ames_all, aes(x=reorder(House.Style, log(price), fun=median))) + geom_bar(alpha = 0.75, color='blue', fill='blue') + xlab("House.Style") + geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)
+
+# Create a grid of plots
+grid.arrange(
+  b1, h1, b2, h2, b3, h3, b4, h4, b5, h5, b6, h6, b7, h7, b8, h8, b9, h9, b10, h10, b11, h11, b12, h12,
+  nrow = 12,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+Distribution of the important categorical variables such as **`Neighborhood`**, **`MS.SubClass`**, **`Fireplace.Qu`** and etc. all exhibit clear group dependencies.
+
+We run pairwise **chi-square test** for all combinations of categorical variables in `ames_all` to evaluate the strength of correlation.
+
+```{r, message = FALSE, warning = FALSE}
+# Run chi-square test for all combinations of categorical variables
+library(plyr)
+cat_df <- droplevels(cat_variables)  
+combos <- combn(ncol(cat_df), 2)
+cat_corelations <- adply(combos, 2, function(x) {
+  column_one <- names(cat_df[, x[1]])
+  column_two <- names(cat_df[, x[2]])
+  mydata <- data.frame(cat_df[, x[1]], cat_df[, x[2]])
+  mytab <- table(mydata)
+  test <- chisq.test(mytab)
+  
+  out <- data.frame('Column.A' = column_one, 
+                    'Column.B' = column_two, 
+                    'Chi.Square' = test$statistic,
+                    'p.value' = test$p.value)
+  
+  return(out)
+})
+
+cat_corelations %>% arrange(p.value)
+```
+
+The output table shows that there are **statistically significant dependencies** between all categorical variables (p.value ~ 0).
+
+# Feature Engineering
+
+## Transformation
+
+**area** 
+
+We take the log transformation of the variable `area` as the distribution becomes more symmetric (histogram below), the relationship to `log(price)` becomes more linear (scatter plot below) and the R-squared for a simple linear regression on `log(price)` has a higher score after the transformation.
+
+```{r, fig.width=6.5, fig.height=6.5, message = FALSE, warning = FALSE}
+# Compare the distributions of area and log(area)
+h1 <- ggplot(data=ames_all, aes(area)) + geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.75, color='blue', fill='blue') + geom_density()
+h2 <- ggplot(data=ames_all, aes(log(area))) + geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.75, color='blue', fill='blue') + geom_density()
+s1 <- ggplot(data=ames_all, aes(x=area, y=log(price))) + geom_point(alpha=0.75)+geom_smooth(method=lm, fill="blue", color="blue")
+s2 <- ggplot(data=ames_all, aes(x=log(area), y=log(price))) + geom_point(alpha=0.75)+geom_smooth(method=lm, fill="blue", color="blue")
+grid.arrange(
+  h1, h2, s1, s2, 
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+
+# Compare skewness and kurtosis of area and log(area)
+cat('Skewness of area:\t', skewness(ames_all$area), '\n') 
+cat('Skewness of ln(area):\t', skewness(log(ames_all$area)), '\n') 
+
+# Compare R squared of simple linear regression using area and log(area)
+nor <- lm(log(price) ~ area, data=ames_all[1:nrow(ames_train),])
+log <- lm(log(price) ~ log(area), data=ames_all[1:nrow(ames_train),])
+cat('R squared for area:\t', summary(nor)$r.squared, '\n') 
+cat('R squared for ln(area):\t', summary(log)$r.squared, '\n')
+
+par(mfrow = c(2, 2))
+
+# Residual analysis for area
+plot(nor, which=c(2,5))
+
+# Residual analysis for log(area)
+plot(log, which=c(2,5))
+```
+
+```{r}
+ames_all <- ames_all %>% mutate(Log.area = log(area)) %>% dplyr::select(-area)
+```
+
+**Total.Bsmt.SF**
+
+We will **not** take the log of `Total.Bsmt.SF` based on the following analysis.
+
+```{r, fig.width=6.5, fig.height=6.5, message = FALSE, warning = FALSE}
+# Compare the distributions of Total.Bsmt.SF and log(Total.Bsmt.SF)
+h1 <- ggplot(data=ames_all, aes(Total.Bsmt.SF)) + geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.75, color='blue', fill='blue') + geom_density()
+h2 <- ggplot(data=ames_all, aes(log(Total.Bsmt.SF+1))) + geom_histogram(aes(y = ..density..), bins = 30, alpha = 0.75, color='blue', fill='blue') + geom_density()
+s1 <- ggplot(data=ames_all, aes(x=Total.Bsmt.SF, y=log(price))) + geom_point(alpha=0.75)+geom_smooth(method=lm, fill="blue", color="blue")
+s2 <- ggplot(data=ames_all, aes(x=log(Total.Bsmt.SF+1), y=log(price))) + geom_point(alpha=0.75)+geom_smooth(method=lm, fill="blue", color="blue")
+grid.arrange(
+  h1, h2, s1, s2, 
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+
+# Compare skewness of Total.Bsmt.SF and log(Total.Bsmt.SF)
+cat('Skewness of BsmtSF:\t', skewness(ames_all$Total.Bsmt.SF), '\n') 
+cat('Skewness of ln(BsmtSF):\t', skewness(log(ames_all$Total.Bsmt.SF)), '\n') 
+
+# Compare R squared of simple linear regression using Total.Bsmt.SF and log(Total.Bsmt.SF)
+nor <- lm(log(price) ~ Total.Bsmt.SF, data=ames_all[1:nrow(ames_train),])
+log <- lm(log(price) ~ log(Total.Bsmt.SF+1), data=ames_all[1:nrow(ames_train),])
+cat('R squared for Total.Bsmt.SF:\t', summary(nor)$r.squared, '\n') 
+cat('R squared for ln(Total.Bsmt.SF):\t', summary(log)$r.squared, '\n')
+
+par(mfrow = c(2, 2))
+
+# Residual analysis for area
+plot(nor, which=c(2,5))
+
+# Residual analysis for log(area)
+plot(log, which=c(2,5))
+```
+
+**Neighborhood**
+
+We reduce the cardinality of the column `Neighborhood` for a computational cost reason.
+
+```{r, fig.width=10, fig.height=7.5, message = FALSE, warning = FALSE}
+b1 <- ggplot(ames_all, aes(x = reorder(Neighborhood, log(price), fun = median), y = log(price))) + geom_boxplot(aes(alpha = 0.75, fill=Neighborhood), alpha=0.5) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) + xlab("Neighborhood")
+
+ames_all$Neighborhood.Binned[ames_all$Neighborhood %in% c('NoRidge', 'NridgHt', 'StoneBr', 'GrnHill', 'Veenker', 'Somerst', 'Timber')] <- 3
+ames_all$Neighborhood.Binned[ames_all$Neighborhood %in% c('ClearCr', 'CollgCr', 'Crawfor', 'Greens', 'Blmngtn', 'NWAmes', 'SawyerW')] <- 2
+ames_all$Neighborhood.Binned[ames_all$Neighborhood %in% c('Gilbert', 'Mitchel', 'NPkVill', 'NAmes', 'Landmrk', 'SWISU', 'Sawyer')] <- 1
+ames_all$Neighborhood.Binned[ames_all$Neighborhood %in% c('Blueste', 'BrkSide', 'Edwards', 'OldTown', 'IDOTRR', 'BrDale', 'MeadowV')] <- 0
+
+ames_all$Neighborhood.Binned <- as.factor(ames_all$Neighborhood.Binned)
+
+b2 <- ggplot(ames_all, aes(x = reorder(Neighborhood.Binned, log(price), fun = median), y = log(price))) + geom_boxplot(aes(alpha = 0.75, fill=Neighborhood.Binned), alpha=0.5) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) + xlab("Neighborhood.Binned")
+
+grid.arrange(
+  b1, b2,
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+
+ames_all <- ames_all %>% dplyr::select(-Neighborhood)
+```
+
+**MS.SubClass**
+
+Reduce the cardinality of the column `MS.SubClass`.
+
+```{r, fig.width=10, fig.height=5, message = FALSE, warning = FALSE}
+b1 <- ggplot(ames_all, aes(x = reorder(MS.SubClass, log(price), fun = median), y = log(price))) + geom_boxplot(aes(alpha = 0.75, fill=MS.SubClass), alpha=0.5) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) + xlab("MS.SubClass")
+
+ames_all$MS.SubClass.Binned[ames_all$MS.SubClass %in% c('60', '120', '80', '75')] <- 3
+ames_all$MS.SubClass.Binned[ames_all$MS.SubClass %in% c('20', '85', '150', '70')] <- 2
+ames_all$MS.SubClass.Binned[ames_all$MS.SubClass %in% c('90', '160', '40', '50')] <- 1
+ames_all$MS.SubClass.Binned[ames_all$MS.SubClass %in% c('190', '45', '30', '180')] <- 0
+ames_all$MS.SubClass.Binned <- as.factor(ames_all$MS.SubClass.Binned)
+
+b2 <- ggplot(ames_all, aes(x = reorder(MS.SubClass.Binned, log(price), fun = median), y = log(price))) + geom_boxplot(aes(alpha = 0.75, fill=MS.SubClass.Binned), alpha=0.5) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank()) + xlab("MS.SubClass.Binned")
+
+grid.arrange(
+  b1, b2,
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+
+ames_all <- ames_all %>% dplyr::select(-MS.SubClass)
+```
+
+**Unimportant Variables**
+
+```{r}
+ames_train %>% dplyr::select(-price, -all_of(imp_var)) %>% colnames()
+```
+
+## Variable Interaction
+
+The following interaction plots suggest that there could potentially be an interaction between (`Log.area` and `Neighborhood.Binned`), (`Log.area` and `MS.SubClass.Binned`), (`Overall.Qual` and `Neighborhood.Binned`) and (`Overall.Qual` and `MS.SubClass.Binned`).
+
+```{r, fig.width=10, fig.height=7.5, message = FALSE, warning = FALSE}
+i1 <- ggplot(aes(y=log(price), x=Log.area, color=Neighborhood.Binned, shape=Neighborhood.Binned), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=lm, se=FALSE, fullrange=TRUE)
+i2 <- ggplot(aes(y=log(price), x=Log.area, color=MS.SubClass.Binned, shape=MS.SubClass.Binned), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=lm, se=FALSE, fullrange=TRUE)
+i3 <- ggplot(aes(y=log(price), x=Overall.Qual, color=Neighborhood.Binned, shape=Neighborhood.Binned), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=lm, se=FALSE, fullrange=TRUE)
+i4 <- ggplot(aes(y=log(price), x=Overall.Qual, color=MS.SubClass.Binned, shape=MS.SubClass.Binned), data=ames_all) + geom_point(alpha=0.75) + geom_smooth(method=lm, se=FALSE, fullrange=TRUE)
+
+grid.arrange(
+  i1, i2, i3, i4,
+  nrow = 2,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+We run simple linear regressions to evaluate if the interaction terms are indeed significant. Although the adjusted R squared reduces once the interaction terms are included (for all combinations), the statistical significance of the added interaction terms are still significantly smaller compared to the original variables (first order terms), so we decide against including these in our linear model. 
+
+```{r}
+wo.Log.area.Neighborhood.Binned <- lm(log(price) ~ Log.area + Neighborhood.Binned, data=ames_all[1:nrow(ames_train),])
+w.Log.area.Neighborhood.Binned <- lm(log(price) ~ Log.area*Neighborhood.Binned, data=ames_all[1:nrow(ames_train),])
+summary(wo.Log.area.Neighborhood.Binned)
+summary(w.Log.area.Neighborhood.Binned)
+
+wo.Overall.Qual.Neighborhood.Binned <- lm(log(price) ~ Log.area + Neighborhood.Binned, data=ames_all[1:nrow(ames_train),])
+w.Overall.Qual.Neighborhood.Binned <- lm(log(price) ~ Log.area*Neighborhood.Binned, data=ames_all[1:nrow(ames_train),])
+summary(wo.Overall.Qual.Neighborhood.Binned)
+summary(w.Overall.Qual.Neighborhood.Binned)
+
+wo.Log.area.MS.SubClass.Binned <- lm(log(price) ~ Log.area + MS.SubClass.Binned, data=ames_all[1:nrow(ames_train),])
+w.Log.area.MS.SubClass.Binned <- lm(log(price) ~ Log.area*MS.SubClass.Binned, data=ames_all[1:nrow(ames_train),])
+
+summary(wo.Log.area.MS.SubClass.Binned)
+summary(w.Log.area.MS.SubClass.Binned)
+
+wo.Overall.Qual.MS.SubClass.Binned <- lm(log(price) ~ Log.area + MS.SubClass.Binned, data=ames_all[1:nrow(ames_train),])
+w.Overall.Qual.MS.SubClass.Binned <- lm(log(price) ~ Log.area*MS.SubClass.Binned, data=ames_all[1:nrow(ames_train),])
+
+summary(wo.Overall.Qual.MS.SubClass.Binned)
+summary(w.Overall.Qual.MS.SubClass.Binned)
+```
+
+# Preprocess
+
+## Normalization
+
+We normalize (scale and center) all numerical attributes.
+
+```{r}
+library(caret)
+preProc <- preProcess(ames_all[,-1], method=c("center", "scale"))
+ames_all <- predict(preProc, ames_all)
+```
+
+## Outliers
+
+We fit a simple multiple linear regression model on the training dataset and evaluate the Cook's distance of the observation points. 
+
+```{r, fig.width=7.5, fig.height=7.5, message = FALSE, warning = FALSE}
+outlier <- lm(log(price) ~ . , data=ames_all[1:nrow(ames_train),])
+par(mfrow = c(2, 2))
+plot(outlier)
+```
+
+From the result, we conclude that none of the points included qualifies as a highly influential leverage point. Therefore, we keep all the observations.
+
+## One-hot Encoding
+
+We take one hot encoding of the factor variables.
+
+```{r}
+# Drop levels with no entries
+ames_all <- droplevels(ames_all)
+
+# One-hot encoding using model.matrix()
+ames_all <- as.data.frame(model.matrix( ~ . -1, ames_all))
+
+# Standarize weird column names
+colnames(ames_all) <- make.names(colnames(ames_all))
+
+# Drop perfectly collinear columns
+drop_collinear <- rownames(alias(lm(log(price) ~ . , data=ames_all))$Complete)
+ames_all <- ames_all %>% dplyr::select(-all_of(drop_collinear))
+```
+
+## Variance Inflation Factor
+
+We drop variables with high VIF (>10) as they make the estimates of coefficients unstable.
+
+```{r}
+# Calculate Variance Inflation Factor of attributes
+library(car)
+vif_df <- data.frame(car::vif(lm(log(price) ~ . , data=ames_all)))
+names(vif_df)[1] <- "GVIF"
+drop_high_vif <- rownames(vif_df %>% filter(GVIF>10) %>% dplyr::arrange(desc(GVIF)))
+ames_all <- ames_all %>% dplyr::select(-all_of(drop_high_vif))
+```
+
+## PCA
+
+In theory, using a reduced dimension data set makes no difference for the outcome of the prediction. PCA only removes the multicollinearity between the fields. We reduce the dimension of the data set by implementing PCA of the continuous numerical variables and later use this data set to see if it improves the performance. 
+
+```{r}
+# Calculate Variance Inflation Factor of attributes
+num_var <- c("Log.area", "Overall.Qual", "Total.Bsmt.SF", "Garage.Cars", "Year.Built", "Year.Remod.Add", "Full.Bath", "Fireplaces")
+dim_reduction <- ames_all %>% dplyr::select(all_of(num_var))
+pca <- prcomp(dim_reduction, center=TRUE, scale.=TRUE, rank. = 3)
+summary(pca)
+```
+
+```{r}
+library(ggbiplot)
+ggbiplot(pca)
+```
+
+```{r}
+rest <- ames_all %>% dplyr::select(-all_of(num_var))
+ames_pca <- merge(rest, pca$x, by=0, sort=FALSE) %>% dplyr::select(-Row.names)
+```
+
+# Modeling
+
+```{r}
+# Split the all data frame back into train, test and validation
+train <- ames_all[1:nrow(ames_train),]
+test <- ames_all[nrow(ames_train)+1:nrow(ames_test),] 
+validation <- ames_all[nrow(ames_train)+nrow(ames_test)+1:nrow(ames_validation),]
+
+train_pca <- ames_pca[1:nrow(ames_train),]
+test_pca <- ames_pca[nrow(ames_train)+1:nrow(ames_test),] 
+validation_pca <- ames_pca[nrow(ames_train)+nrow(ames_test)+1:nrow(ames_validation),]
+```
+
+## Multiple Linear Regression
+
+We run a multiple linear regression on the pre-processed data set including the interaction terms mentioned above. R is directly solving the normal equations to obtain the least square fit: $$\hat{\beta} = (X^{T}X)^{-1}X^{T}Y$$
+
+```{r}
+# Run multiple linear regression on log(price) using the full model
+linear_model <- lm(log(price) ~ . , data=train)
+summary(linear_model)$adj.r.squared
+```
+
+### Variable Selection: AIC/BIC Backward Elimination
+
+We run **stepwise backward variables elimination using AIC and BIC** to find the best model.
+
+$$AIC = 2k - 2log(L)$$
+$$BIC = klog(n) - 2log(L)$$
+
+```{r model_select_final}
+# Model selection using AIC
+start_time <- Sys.time()
+linear_model.AIC <- stepAIC(linear_model, k=2, trace=0)
+end_time <- Sys.time()
+end_time - start_time
+```
+
+```{r}
+start_time <- Sys.time()
+linear_model.BIC <- stepAIC(linear_model, k=log(nrow(train)), trace=0)
+end_time <- Sys.time()
+end_time - start_time
+```
+
+```{r}
+summary(linear_model.AIC)$adj.r.squared
+summary(linear_model.BIC)$adj.r.squared
+```
+
+`linear_model.AIC` has a lower adjusted R squared than `linear_model` or `linear_model.BIC`.
+
+### Residuals
+
+We use **`linear_model.AIC`** (suggestion from the AIC based backward elimination) to analyze the residuals. 
+
+```{r model_resid, fig.width=7.5, fig.height=7.5, message = FALSE, warning = FALSE}
+par(mfrow = c(2, 2))
+plot(linear_model.AIC, which = c(1,2,3,4))
+```
+
+From the result, we notice that the leverage for some observations are one. This is due to the fact these observations takes values with only one member. We ignore this case. Next, from the residual plots, we see that the residual for observations 498, 906 and 979 are about 4-6.25 standard deviations away from the estimated mean. We acknowledge that these points are high leverage points, but since their Cook's distance (scaler metric that indicates the strength of an influence of a single observation on the overall fit) fall well below 0.5, we decide against excluding these observations from our analysis. Besides these outliers, the residual plots suggest **normality** and **homoscadasticity**. 
+
+### RMSE
+
+We calculate **RMSE** in its original unit ($) using AIC and BIC models.
+
+```{r model_rmse, fig.width=12, fig.height=4, message = FALSE, warning = TRUE}
+# Train
+# Full
+predict.linear_model <- exp(predict(linear_model, train))
+resid.linear_model <- train$price - predict.linear_model
+rmse.linear_model <- sqrt(mean(resid.linear_model^2))
+cat('Linear model (Full) RMSE on train: ', rmse.linear_model, '\n')
+
+# AIC
+predict.linear_model.AIC <- exp(predict(linear_model.AIC, train))
+resid.linear_model.AIC <- train$price - predict.linear_model.AIC
+rmse.linear_model.AIC <- sqrt(mean(resid.linear_model.AIC^2))
+cat('Linear model (AIC) RMSE on train: ', rmse.linear_model.AIC, '\n')
+
+# BIC
+predict.linear_model.BIC <- exp(predict(linear_model.BIC, train))
+resid.linear_model.BIC <- train$price - predict.linear_model.BIC
+rmse.linear_model.BIC <- sqrt(mean(resid.linear_model.BIC^2))
+cat('Linear model (BIC) RMSE on train: ', rmse.linear_model.BIC, '\n')
+
+p1 <- ggplot(aes(x=price, y=predict.linear_model), data=train) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Full Model Train")
+p2 <- ggplot(aes(x=price, y=predict.linear_model.AIC), data=train) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("AIC Model Train")
+p3 <- ggplot(aes(x=price, y=predict.linear_model.BIC), data=train) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("BIC Model Train")
+
+grid.arrange(
+  p1, p2, p3, 
+  nrow = 1,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+
+# Test
+# Full
+predict.linear_model <- exp(predict(linear_model, test))
+resid.linear_model <- test$price - predict.linear_model
+rmse.linear_model <- sqrt(mean(resid.linear_model^2))
+cat('Linear model (Full) RMSE on test: ', rmse.linear_model, '\n')
+
+# AIC
+predict.linear_model.AIC <- exp(predict(linear_model.AIC, test))
+resid.linear_model.AIC <- test$price - predict.linear_model.AIC
+rmse.linear_model.AIC <- sqrt(mean(resid.linear_model.AIC^2))
+cat('Linear model (AIC) RMSE on test: ', rmse.linear_model.AIC, '\n')
+
+# BIC
+predict.linear_model.BIC <- exp(predict(linear_model.BIC, test))
+resid.linear_model.BIC <- test$price - predict.linear_model.BIC
+rmse.linear_model.BIC <- sqrt(mean(resid.linear_model.BIC^2))
+cat('Linear model (BIC) RMSE on test: ', rmse.linear_model.BIC, '\n')
+
+p1 <- ggplot(aes(x=price, y=predict.linear_model), data=test) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Full Model Test")
+p2 <- ggplot(aes(x=price, y=predict.linear_model.AIC), data=test) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("AIC Model Test")
+p3 <- ggplot(aes(x=price, y=predict.linear_model.BIC), data=test) + geom_jitter(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("BIC Model Test")
+
+grid.arrange(
+  p1, p2, p3,
+  nrow = 1,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+The results suggest that the RMSE for predictions on a training data set for AIC is higher than BIC by about $xxx In the scatter plots showing the predicted value vs. actual value, **AIC model seems to be fitting the data better especially at large values**. Interestingly, **the RMSE on the testing data set is significantly lower than on the training data set for both AIC and BIC models**. This result implies:
+  
+  1. The training set had many 'hard' cases to learn
+  2. The testing set had mostly 'easy' cases to predict
+  
+## Ridge Regression
+
+We use cross validation for hyper parameter tuning ($\lambda$), which is the penalty factor for the L2 norm of the coefficients.
+
+```{r, fig.width=7, fig.height=3.5}
+library(glmnet)
+set.seed(1)
+
+x_train = as.matrix(train[,-1])
+y_train = log(train$price)
+
+x_test = as.matrix(test[,-1])
+y_test = log(test$price)
+
+# Returns sequence of models with different lambdas
+lambdas <- 10^seq(3, -3, by = -.1)
+ridge_model_glmridge = glmnet(x_train, y_train, alpha=0, lambda=lambdas)
+cv_ridge <- cv.glmnet(x_train, y_train, alpha=0, lambda=lambdas)
+plot(cv_ridge)
+optimal_lambda_ridge <- cv_ridge$lambda.min
+cat('Optimal lambda for ridge regression: ', optimal_lambda_ridge, '\n')
+
+predict.ridge_model_train <- exp(predict(ridge_model_glmridge, s=optimal_lambda_ridge, x_train))
+resid.ridge_model_train <- train$price - predict.ridge_model_train
+rmse.ridge_model_train <- sqrt(mean(resid.ridge_model_train^2))
+sse.train <- sum((predict.ridge_model_train - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('Ridge regression RMSE and R-square on train:\t', rmse.ridge_model_train, '\t', r_square.train, '\n')
+
+p1 <- ggplot(aes(x=price, y=predict.ridge_model_train), data=train) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Ridge Regression on Train Data")
+
+predict.ridge_model_test <- exp(predict(ridge_model_glmridge, s=optimal_lambda_ridge,  x_test))
+resid.ridge_model_test <- test$price - predict.ridge_model_test
+rmse.ridge_model_test <- sqrt(mean(resid.ridge_model_test^2))
+sse.test <- sum((predict.ridge_model_test - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Ridge regression RMSE and R-square on test:\t', rmse.ridge_model_test, '\t', r_square.test, '\n')
+
+p2 <- ggplot(aes(x=price, y=predict.ridge_model_test), data=test) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Ridge Regression on Test Data")
+
+grid.arrange(
+  p1, p2, 
+  nrow = 1,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+## Lasso Regression
+
+We use cross validation for hyper parameter tuning ($\lambda$), which is the penalty factor for the L1 norm of the coefficients.
+
+```{r, fig.width=7, fig.height=3.5}
+set.seed(1)
+lambdas <- 10^seq(2, -3, by=-0.1)
+
+lasso_model_glmridge = glmnet(x_train, y_train, alpha=1, lambda=lambdas)
+cv_lasso <- cv.glmnet(x_train, y_train, alpha=1, lambda=lambdas)
+plot(cv_lasso)
+optimal_lambda_lasso <- cv_lasso$lambda.min
+cat('Optimal lambda for lasso regression:\t', optimal_lambda_lasso, '\n')
+
+predict.lasso_model_train <- exp(predict(lasso_model_glmridge, s=optimal_lambda_lasso, x_train))
+resid.lasso_model_train <- train$price - predict.lasso_model_train
+rmse.lasso_model_train <- sqrt(mean(resid.lasso_model_train^2))
+sse.train <- sum((predict.lasso_model_train - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('Lasso regression RMSE and R-square on train:\t', rmse.lasso_model_train, '\t', r_square.train, '\n')
+
+p1 <- ggplot(aes(x=price, y=predict.lasso_model_train), data=train) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Lasso Regression on Train Data")
+
+predict.lasso_model_test <- exp(predict(lasso_model_glmridge, s=optimal_lambda_lasso,  x_test))
+resid.lasso_model_test <- test$price - predict.lasso_model_test
+rmse.lasso_model_test <- sqrt(mean(resid.lasso_model_test^2))
+sse.test <- sum((predict.lasso_model_test - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Lasso regression RMSE and R-square on test:\t', rmse.lasso_model_test, '\t', r_square.test, '\n')
+
+p2 <- ggplot(aes(x=price, y=predict.lasso_model_test), data=test) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Lasso Regression on Test Data")
+
+grid.arrange(
+  p1, p2, 
+  nrow = 1,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+## Elastic Regression
+
+We carry out repeated 10-fold cross validation 5 times to find the optimal parameters (lambda and alpha). We use a randomized grid search.
+
+```{r, fig.width=7, fig.height=3.5}
+set.seed(1)
+# Set training control
+train_cont <- trainControl(method="repeatedcv", number=10, repeats=5, search="random", verboseIter=FALSE)
+# Train the model
+elastic_model <- train(log(price) ~ ., data=train, method="glmnet", tuneLength=10, trControl=train_cont)
+# Best tuning parameter
+elastic_model$bestTune
+
+predict.elastic_model_train <- exp(predict(elastic_model, x_train))
+resid.elastic_model_train <- train$price - predict.elastic_model_train
+rmse.elastic_model_train <- sqrt(mean(resid.elastic_model_train^2))
+sse.train <- sum((predict.elastic_model_train - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('\nElastic regression RMSE and R-square on train:\t', rmse.elastic_model_train, '\t', r_square.train, '\n')
+
+p1 <- ggplot(aes(x=price, y=predict.elastic_model_train), data=train) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Elastic Regression on Train Data")
+
+predict.elastic_model_test <- exp(predict(elastic_model, x_test))
+resid.elastic_model_test <- test$price - predict.elastic_model_test
+rmse.elastic_model_test <- sqrt(mean(resid.elastic_model_test^2))
+sse.test <- sum((predict.elastic_model_test - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Elastic regression RMSE and R-square on test:\t', rmse.elastic_model_test, '\t', r_square.test, '\n')
+
+p2 <- ggplot(aes(x=price, y=predict.elastic_model_test), data=test) + geom_point(alpha=0.5) + geom_abline(intercept=0, slope=1, color='blue') + xlab("Actual Value") + ylab("Predited Value") + ggtitle("Elastic Regression on Test Data")
+
+grid.arrange(
+  p1, p2, 
+  nrow = 1,
+  bottom = textGrob(
+    "",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1,
+    x = 1
+  )
+)
+```
+
+## Bayes Linear Regression (Probablistic Modeling)
+
+**Need to understand how the coefficients are updated by the observations and how the probabilities are calculated.**
+
+```{r , fig.width=12.5, fig.height=7.5}
+# Fit the model: Bayesian
+bma <- bas.lm(log(price) ~ . , data=train, prior="BIC", modelprior=uniform())
+# Print out the marginal posterior inclusion probability of each variable                
+bma
+# Top 5 most probably models
+summary(bma)
+```
+
+```{r}
+# RMSE on Training Data
+# Highest Probability Model
+pred.train.HPM <- predict(bma, newdata=train, estimator="HPM")
+pred.HPM.rmse <- sqrt(mean((exp(pred.train.HPM$fit) - train$price)^2))
+sse.train <- sum((exp(pred.train.HPM$fit) - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('Highest Probability Model (RMSE & R Square) :\t', pred.HPM.rmse, '\t', r_square.train, '\n')
+
+# Median Probability Model
+pred.train.MPM <- predict(bma, newdata=train, estimator="MPM")
+pred.MPM.rmse <- sqrt(mean((exp(pred.train.MPM$fit) - train$price)^2))
+sse.train <- sum((exp(pred.train.MPM$fit) - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('Median Probability Model (RMSE & R Square) :\t', pred.MPM.rmse, '\t', r_square.train, '\n')
+
+# Average over all the models (computation heavy)
+#pred.train.BPM <- predict(bma, newdata=train, estimator='BPM')
+#pred.BPM.rmse <- sqrt(mean((exp(pred.train.BPM$fit) - train$price)^2))
+#sse.train <- sum((exp(pred.train.MPM$fit) - train$price)^2)
+#sst.train <- sum((train$price - mean(train$price))^2)
+#r_square.train <- 1 - sse.train/sst.train
+#cat('Average over all the models:\t', pred.BPM.rmse, '\t', r_square.train)
+```
+
+```{r}
+# RMSE on Testing Data
+# Highest Probability Model
+pred.test.HPM <- predict(bma, newdata=test, estimator="HPM")
+pred.HPM.rmse <- sqrt(mean((exp(pred.test.HPM$fit) - test$price)^2))
+sse.test <- sum((exp(pred.test.HPM$fit) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Highest Probability Model (RMSE & R Square) :\t', pred.HPM.rmse, '\t', r_square.test, '\n')
+
+# Median Probability Model
+pred.test.MPM <- predict(bma, newdata=test, estimator="MPM")
+pred.MPM.rmse <- sqrt(mean((exp(pred.test.MPM$fit) - test$price)^2))
+sse.test <- sum((exp(pred.test.MPM$fit) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Median Probability Model (RMSE & R Square) :\t', pred.MPM.rmse, '\t', r_square.test, '\n')
+
+# Average over all the models
+#pred.test.BPM <- predict(bma, newdata=test, estimator='BPM')
+#pred.BPM.rmse <- sqrt(mean((exp(pred.test.BPM$fit) - test$price)^2))
+#sse.test <- sum((exp(pred.test.MPM$fit) - test$price)^2)
+#sst.test <- sum((test$price - mean(test$price))^2)
+#r_square.test <- 1 - sse.test/sst.test
+#cat('Average over all the models:\t', pred.BPM.rmse, '\t', r_square.test)
+```
+
+## Kernel Regression (Non Parametric)
+
+Usually with just one predictor due to the curse of dimensionality. As the number of variables increases, so does the computational cost quadratically. We find the optimal bandwidth using `npregbw()`.
+
+```{r}
+library(np)
+# https://bookdown.org/egarpor/NP-UC3M/kre-i-np.html
+# The spinner can be omitted with
+options(np.messages = FALSE)
+
+# npregbw() computes by default the least squares CV bandwidth associated to a local *constant* fit
+bw_lc <- npregbw(log(price) ~ Log.area + Overall.Qual + Total.Bsmt.SF, data=train)
+bw_ll <- npregbw(log(price) ~ Log.area + Overall.Qual + Total.Bsmt.SF, data=train, regtype="ll")
+```
+
+```{r}
+# Locally constant Gaussian kernel regression on the training data 
+kre_lc_train <- npreg(bws=bw_lc)
+# Locally linear Gaussian kernel regression on the training data 
+kre_ll_train <- npreg(bws=bw_ll)
+
+# Visualization only good for one predictor. Otherwise, it could be a mess.
+#plot(kre_lc, col=2, type = "o")
+#points(train$Log.area, log(train$price))
+#plot(kre_ll, col=2, type = "o")
+#points(train$Log.area, log(train$price))
+```
+
+
+```{r}
+# Locally linear Gaussian kernel regression on the testing data 
+kre_ll_test <- npreg(bw_ll, newdata=test, y.eval=TRUE)
+kre_lc_test <- npreg(bw_lc, newdata=test, y.eval=TRUE)
+
+pred.kre_ll <- kre_ll_test$mean
+rmse <- sqrt(mean((exp(pred.kre_ll) - test$price)^2))
+sse.test <- sum((exp(pred.kre_ll) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Locally Linear Gaussian Kernel Regression (RMSE & R Square) :\t', rmse, '\t', r_square.test, '\n')
+
+pred.kre_lc <- kre_lc_test$mean
+rmse <- sqrt(mean((exp(pred.kre_lc) - test$price)^2))
+sse.test <- sum((exp(pred.kre_lc) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Locally Constant Gaussian Kernel Regression (RMSE & R Square) :\t', rmse, '\t', r_square.test, '\n')
+```
+
+## Regression Tree
+
+**Pruning** (stopping the tree to grow and avoiding splitting a partition if the split does not significantly improves the overall quality of the model) is performed by `caret` package, which invokes `rpart` method for automatically testing different values of cp. Then it chooses the optimal cp that maximize the cross-validation accuracy and fits the final best CART model that explains the best the data. `tuneLength` is for specifying the number of possible cp values to evaluate. Default value is 3, here we’ll use 10.
+
+```{r, fig.width=7.5, fig.height=7.5}
+library(rpart)
+library(rpart.plot)
+
+regression_tree <- train(log(price) ~ . , data=train, method="rpart", trControl=trainControl("cv", number=10), tuneLength=10 )
+
+# Plot model error vs different values of complexity parameter
+plot(regression_tree)
+
+# Print the best tuning parameter cp that minimize the model RMSE
+regression_tree$bestTune
+
+# Plot the final tree model
+rpart.plot(regression_tree$finalModel)
+
+# Decision rules in the model
+regression_tree$finalModel
+```
+
+```{r}
+# Train
+best_tree <- regression_tree$finalModel
+
+predictions.train <- predict(best_tree, train)
+rmse.train <- sqrt(mean((exp(predictions.train) - train$price)^2))
+sse.train <- sum((exp(predictions.train) - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('Regression Tree on Train (RMSE & R Square) :\t', rmse.train, '\t', r_square.train, '\n')
+
+# Test
+predictions.test <- predict(best_tree, test)
+rmse.test <- sqrt(mean((exp(predictions.test) - test$price)^2))
+sse.test <- sum((exp(predictions.test) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Regression Tree on test (RMSE & R Square) :\t', rmse.test, '\t', r_square.test, '\n')
+```
+
+## Random Forest Regression (Ensembling)
+
+Here, we will use 5-fold cross validation 5 times (repeated CV). mtry is the number of variables randomly sampled as candidates at each split.
+
+```{r}
+library(randomForest)
+# Set up a 5-fold cross validation
+#control <- trainControl(method="cv", number=5)
+# Set up a 5-fold cross validation 5 times (repeated CV)
+control <- trainControl(method="repeatedcv", number=5, repeats=5)
+
+random_forest_model <- train(log(price) ~ . , data=train, method="rf", trControl=control)
+
+# Best Model
+random_forest_model$bestTune
+```
+
+```{r}
+# Train
+best_forest <- random_forest_model$finalModel
+
+predictions.train <- predict(best_forest, train)
+rmse.train <- sqrt(mean((exp(predictions.train) - train$price)^2))
+sse.train <- sum((exp(predictions.train) - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('Regression Tree on Train (RMSE & R Square) :\t', rmse.train, '\t', r_square.train, '\n')
+
+# Test
+predictions.test <- predict(best_forest, test)
+rmse.test <- sqrt(mean((exp(predictions.test) - test$price)^2))
+sse.test <- sum((exp(predictions.test) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('Regression Tree on test (RMSE & R Square) :\t', rmse.test, '\t', r_square.test, '\n')
+```
+
+## Gradient Boosting Regression (Ensembling)
+
+We use `caret` to run a grid search to find the optimal hyper parameters (`eta`, `max_depth`, `min_child_weight`). Note that this will take some time since we are not running `xgboost` directly using the library with the efficient data type (xgb.DMatrix).
+
+```{r}
+library(xgboost)
+
+xgb_grid = expand.grid(
+  nrounds = 1000,
+  eta = c(0.1, 0.05, 0.01),
+  max_depth = c(2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree=1,
+  #min_child_weight=c(1, 2, 3, 4 ,5),
+  min_child_weight=c(4),
+  subsample=1
+)
+```
+
+Let caret find the best hyperparameter values (using 5 fold cross validation).
+
+```{r, message=FALSE, warning=FALSE}
+start_time <- Sys.time()
+control <-trainControl(method="cv", number=5)
+#xgb_caret <- train(log(price) ~ . , data=train, method='xgbTree', trControl=control, tuneGrid=xgb_grid) 
+#xgb_caret$bestTune
+end_time <- Sys.time()
+end_time - start_time
+# Time difference of 20.82481 secs for one set of parameters
+```
+
+The optimal parameters are `Max_depth=3`, `eta=0.05`, `Min_child_weight=4`.
+
+```{r}
+default_param<-list(
+        objective = "reg:squarederror",
+        booster = "gbtree",
+        eta=0.05, #default = 0.3
+        gamma=0,
+        max_depth=3, #default=6
+        min_child_weight=4, #default=1
+        subsample=1,
+        colsample_bytree=1
+)
+```
+
+
+```{r}
+# put our testing & training data into two separate Dmatrixs objects
+dtrain <- xgb.DMatrix(data=x_train, label=y_train)
+dtest <- xgb.DMatrix(data=x_test, label=y_test)
+```
+
+We do a cross validation on the number of rounds using the method `xgb.cv` from `xgboost`.
+
+```{r}
+xgbcv <- xgb.cv(params=default_param, data=dtrain, nrounds=500, nfold=5, showsd=T, stratified=T, print_every_n=40, early_stopping_rounds=10, maximize=F)
+```
+
+```{r}
+#train the model using the best iteration found by cross validation
+xgb_model <- xgb.train(data=dtrain, params=default_param, nrounds=254)
+
+# Train
+predictions.train <- predict(xgb_model, dtrain)
+rmse.train <- sqrt(mean((exp(predictions.train) - train$price)^2))
+sse.train <- sum((exp(predictions.train) - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('XGB on Train (RMSE & R Square) :\t', rmse.train, '\t', r_square.train, '\n')
+
+# Test
+predictions.test <- predict(xgb_model, dtest)
+rmse.test <- sqrt(mean((exp(predictions.test) - test$price)^2))
+sse.test <- sum((exp(predictions.test) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('XGB on test (RMSE & R Square) :\t\t', rmse.test, '\t', r_square.test, '\n')
+```
+
+```{r}
+#view variable importance plot
+library(Ckmeans.1d.dp) #required for ggplot clustering
+mat <- xgb.importance(feature_names=colnames(x_train), model=xgb_model)
+xgb.ggplot.importance(importance_matrix=mat[1:20], rel_to_first=TRUE)
+```
+
+## Neural Network Regression
+
+We use `caret`'s method `nnet` to run a 5-fold cross validation to find the best number of nodes and weight decay factor.
+
+```{r}
+library(neuralnet)
+#http://sebastianderi.com/aexam/hld_MODEL_neural.html
+
+set.seed(1)
+
+# Step 1: SELECT TUNING PARAMETERS
+# Set range of tuning parameters (layer size [number of nodes] and weight decay)
+tune_grid_neural <- expand.grid(size=c(1:5), decay=c(0, 0.05, 0.1, 0.5, 1))
+
+# Set other constrains to be imposed on network (to keep computation manageable)
+max_size_neaural <- max(tune_grid_neural$size)
+max_weights_neural <- max_size_neaural*(nrow(train) + 1) + max_size_neaural + 1
+
+# Step 2: SELECT TUNING METHOD
+# set up train control object, which specifies training/testing technique
+control_neural <- trainControl(method="cv", number=5)
+
+# Step 3: TRAIN MODEL
+nn <- train(log(price) ~ . , data=train, method="nnet", linout=TRUE, tuneGrid=tune_grid_neural, trControl=control_neural, trace=FALSE, maxit=100)
+
+nn_model <- nn$finalModel
+```
+
+```{r}
+# Train
+predictions.train <- predict(nn_model, train)
+rmse.train <- sqrt(mean((exp(predictions.train) - train$price)^2))
+sse.train <- sum((exp(predictions.train) - train$price)^2)
+sst.train <- sum((train$price - mean(train$price))^2)
+r_square.train <- 1 - sse.train/sst.train
+cat('NN on Train (RMSE & R Square) :\t', rmse.train, '\t', r_square.train, '\n')
+
+# Test
+predictions.test <- predict(nn_model, test)
+rmse.test <- sqrt(mean((exp(predictions.test) - test$price)^2))
+sse.test <- sum((exp(predictions.test) - test$price)^2)
+sst.test <- sum((test$price - mean(test$price))^2)
+r_square.test <- 1 - sse.test/sst.test
+cat('NN on test (RMSE & R Square) :\t', rmse.test, '\t', r_square.test, '\n')
+```
+
+# Validation
+
+```{r, message = FALSE, warning = FALSE}
+
+eval_metrics = function(model, validation){
+    predictions <- exp(predict(model, validation))
+    residuals <- validation$price - predictions
+    rmse <- sqrt(mean(residuals^2))
+    adj_r2 <- summary(model)$adj.r.squared
+    cat(rmse, '\t', adj_r2, '\n')
+}
+
+eval_metrics_gml = function(model, validation, optimal_lambda){
+    x_validate = as.matrix(validation[,-1])
+    y_validate = log(validation$price)
+    predictions <- exp(predict(model, s=optimal_lambda, x_validate))
+    residuals <- validation$price - predictions
+    rmse <- sqrt(mean(residuals^2))
+    sse <- sum((predictions - validation$price)^2)
+    sst <- sum((validation$price - mean(validation$price))^2)
+    r_square <- 1 - sse/sst
+    cat(rmse, '\t', r_square, '\n')
+}
+
+eval_metrics_elastic_gml = function(model, validation){
+    x_validate = as.matrix(validation[,-1])
+    y_validate = log(validation$price)
+    predictions <- exp(predict(model, x_validate))
+    residuals <- validation$price - predictions
+    rmse <- sqrt(mean(residuals^2))
+    sse <- sum((predictions - validation$price)^2)
+    sst <- sum((validation$price - mean(validation$price))^2)
+    r_square <- 1 - sse/sst
+    cat(rmse, '\t', r_square, '\n')
+}
+
+eval_metrics_bma = function(model, validation){
+    predictions <- predict(bma, newdata=validation, estimator="HPM")
+    rmse <- sqrt(mean((exp(predictions$fit) - validation$price)^2))
+    sse <- sum((exp(predictions$fit) - validation$price)^2)
+    sst <- sum((validation$price - mean(validation$price))^2)
+    r_square <- 1 - sse/sst
+    cat(rmse, '\t', r_square, '\n')
+}
+
+eval_metrics_kernel = function(bw, validation){
+    # Removing outlier... Non-paramteric models are not good for extrapolation
+    validation <- validation %>% filter(price!=284000 & Overall.Qual!=1.4286999 & Total.Bsmt.SF!=5.1786677591 & Log.area!=0.444833205)
+    
+    kre <- npreg(bw, newdata=validation, y.eval=TRUE)
+    predictions <- kre$mean
+    rmse <- sqrt(mean((exp(predictions) - validation$price)^2))
+    sse <- sum((exp(predictions) - validation$price)^2)
+    sst <- sum((test$price - mean(validation$price))^2)
+    r_square <- 1-sse/sst
+    cat(rmse, '\t', r_square, '\n')
+}
+
+eval_metrics_others = function(model, validation){
+    predictions <- predict(model, validation)
+    rmse <- sqrt(mean((exp(predictions) - validation$price)^2))
+    sse <- sum((exp(predictions) - validation$price)^2)
+    sst <- sum((validation$price - mean(validation$price))^2)
+    r_square <- 1 - sse/sst
+    cat(rmse, '\t', r_square, '\n')
+}
+
+eval_metrics_xgb = function(model, validation){
+    x_validate = as.matrix(validation[,-1])
+    y_validate = log(validation$price)
+    dval <- xgb.DMatrix(data=x_validate, label=y_validate)
+    predictions <- predict(model, dval)
+    rmse <- sqrt(mean((exp(predictions) - validation$price)^2))
+    sse <- sum((exp(predictions) - validation$price)^2)
+    sst <- sum((validation$price - mean(validation$price))^2)
+    r_square <- 1 - sse/sst
+    cat(rmse, '\t', r_square, '\n')
+}
+
+```
+
+
+```{r, message = FALSE, warning = FALSE}
+cat('RMSE and Adjusted R Square on Validation Data\n\n')
+
+cat('linear full:\t\t')
+eval_metrics(linear_model, validation)
+cat('linear AIC:\t\t')
+eval_metrics(linear_model.AIC, validation)
+cat('linear BIC:\t\t')
+eval_metrics(linear_model.BIC, validation)
+cat('ridge:\t\t\t')
+eval_metrics_gml(ridge_model_glmridge, validation, optimal_lambda_lasso)
+cat('lasso:\t\t\t')
+eval_metrics_gml(lasso_model_glmridge, validation, optimal_lambda_ridge)
+cat('elastic net:\t\t')
+eval_metrics_elastic_gml(elastic_model, validation)
+cat('baseysian linear:\t')
+eval_metrics_bma(bma, validation)
+cat('kernel regression:\t')
+eval_metrics_kernel(bw_ll, validation)
+cat('regression tree:\t')
+eval_metrics_others(best_tree, validation)
+cat('random forest:\t\t')
+eval_metrics_others(best_forest, validation)
+cat('xgboost model:\t\t')
+eval_metrics_xgb(xgb_model, validation)
+cat('nn model:\t\t')
+eval_metrics_others(nn_model, validation)
+```
+
+The resulting RMSE is smaller compared to the RMSEs from both the training and the testing data.
+
+```{r, message = FALSE, warning = FALSE}
+# Calculate proportion of observations that fall within prediction intervals
+interval.linear_model.AIC <- exp(predict(linear_model.AIC, validation, interval="prediction"))
+coverage.prob.linear_model.AIC <- mean(validation$price > interval.linear_model.AIC[,"lwr"] & validation$price < interval.linear_model.AIC[,"upr"])
+coverage.prob.linear_model.AIC
+```
+
+**Finally, 97% of the observations contain the true price of the house within their 95% predictive confidence (or credible) intervals. From this result, we can state that our final model properly reflects uncertainty.**
+
+* * *
+
+# Conclusion
+
+* * *
+
+We studied the housing price data set in detail in the EDA section. We found that there is a strong multicolinearity between many variables (both numerical and categorical). Strong correlations and statistical tests for significance indicate that attributes like `Overall.Qual`, `area` and `Total.Bsmt.SF` make the best predictors for the response variable `price`. These attributes all have a positive association with the response variable. Our final linear regression achieved RMSE-score of 21872.24 and the coverage percentage of 97% (i.e. percentage of observations containing the true price within their 95% predictive confidence (or credible) intervals.
+
+Referring back to the original purpose of this study, which is to identify the houses that are underpriced in the market, those house could be identified as any house under the blue line in the plot **AIC Model Validation** (see above).
+
+* * *
